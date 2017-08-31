@@ -61,6 +61,7 @@ import re
 import errno
 import tempfile
 import platform
+import zlib
 from hashlib import md5
 from time import time
 try:
@@ -556,9 +557,12 @@ class RedisCache(BaseCache):
 
     Any additional keyword arguments will be passed to ``redis.Redis``.
     """
+    _FLAG_COMPRESSED = 0
 
-    def __init__(self, host='localhost', port=6379, password=None,
-                 db=0, default_timeout=300, key_prefix=None, **kwargs):
+    def __init__(self, host='localhost', port=6379, password=None, db=0,
+                 default_timeout=300, key_prefix=None,
+                 compressor=zlib.compress, decompressor=zlib.decompress,
+                 min_compress_len=None, **kwargs):
         BaseCache.__init__(self, default_timeout)
         if isinstance(host, string_types):
             try:
@@ -573,6 +577,9 @@ class RedisCache(BaseCache):
         else:
             self._client = host
         self.key_prefix = key_prefix or ''
+        self.compressor = compressor
+        self.decompressor = decompressor
+        self.min_compress_len = min_compress_len
 
     def _normalize_timeout(self, timeout):
         timeout = BaseCache._normalize_timeout(self, timeout)
@@ -607,31 +614,67 @@ class RedisCache(BaseCache):
             return value
 
     def get(self, key):
-        return self.load_object(self._client.get(self.key_prefix + key))
+        name = self.key_prefix + key
+        value = self._client.get(name)
+
+        if self._client.getbit(name, self._FLAG_COMPRESSED):
+            value = self.decompressor(value)
+
+        return self.load_object(value)
 
     def get_many(self, *keys):
         if self.key_prefix:
             keys = [self.key_prefix + key for key in keys]
-        return [self.load_object(x) for x in self._client.mget(keys)]
+
+        def decompress_maybe(key, value):
+            if self._client.getbit(key, self._FLAG_COMPRESSED):
+                return self.decompressor(value)
+
+            return value
+
+        return [self.load_object(decompress_maybe(key, value))
+                for key, value in zip(keys, self._client.mget(keys))]
 
     def set(self, key, value, timeout=None):
+        name = self.key_prefix + key
         timeout = self._normalize_timeout(timeout)
         dump = self.dump_object(value)
+        compress = self.min_compress_len and self.min_compress_len < len(dump)
+
+        if compress:
+            dump = self.compressor(dump)
+
         if timeout == -1:
-            result = self._client.set(name=self.key_prefix + key,
-                                      value=dump)
+            result = self._client.set(name=name, value=dump)
         else:
-            result = self._client.setex(name=self.key_prefix + key,
-                                        value=dump, time=timeout)
+            result = self._client.setex(name=name, value=dump, time=timeout)
+
+        if compress:
+            self._client.setbit(self.key_prefix + key, self._FLAG_COMPRESSED, 1)
+
         return result
 
+    # TODO: foreslå
+    "__GZ"
+
     def add(self, key, value, timeout=None):
+        name = self.key_prefix + key
         timeout = self._normalize_timeout(timeout)
         dump = self.dump_object(value)
-        return (
-            self._client.setnx(name=self.key_prefix + key, value=dump) and
-            self._client.expire(name=self.key_prefix + key, time=timeout)
+        compress = self.min_compress_len and self.min_compress_len < len(dump)
+
+        if compress:
+            dump = self.compressor(dump)
+
+        was_added = (
+            self._client.setnx(name=name, value=dump) and
+            self._client.expire(name=name, time=timeout)
         )
+
+        if was_added and compress:
+            self._client.setbit(self.key_prefix + key, self._FLAG_COMPRESSED, 1)
+
+        return was_added
 
     def set_many(self, mapping, timeout=None):
         timeout = self._normalize_timeout(timeout)
@@ -640,12 +683,22 @@ class RedisCache(BaseCache):
         pipe = self._client.pipeline(transaction=False)
 
         for key, value in _items(mapping):
+            name = self.key_prefix + key
             dump = self.dump_object(value)
+            compress = self.min_compress_len and \
+                self.min_compress_len < len(dump)
+
+            if compress:
+                dump = self.compressor(dump)
+
             if timeout == -1:
-                pipe.set(name=self.key_prefix + key, value=dump)
+                pipe.set(name=name, value=dump)
             else:
-                pipe.setex(name=self.key_prefix + key, value=dump,
-                           time=timeout)
+                pipe.setex(name=name, value=dump, time=timeout)
+
+            if compress:
+                pipe.setbit(name, self._FLAG_COMPRESSED, 1)
+
         return pipe.execute()
 
     def delete(self, key):

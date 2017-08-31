@@ -75,6 +75,8 @@ class CacheTests(object):
 
     def test_generic_get_set(self, c):
         assert c.set('foo', ['bar'])
+        asdf = c
+        import pdb; pdb.set_trace()
         assert c.get('foo') == ['bar']
 
     def test_generic_get_many(self, c):
@@ -197,11 +199,11 @@ class TestRedisCache(CacheTests):
         yield
         xprocess.getinfo('redis_server').terminate()
 
-    @pytest.fixture(params=(None, False, True))
+    @pytest.fixture(params=[(x, y) for x in [None, False, True] for y in [False, True]])
     def make_cache(self, request):
-        if request.param is None:
+        if request.param[0] is None:
             host = 'localhost'
-        elif request.param:
+        elif request.param[0]:
             host = redis.StrictRedis()
         else:
             host = redis.Redis()
@@ -209,6 +211,7 @@ class TestRedisCache(CacheTests):
         c = cache.RedisCache(
             host=host,
             key_prefix='werkzeug-test-case:',
+            **({'min_compress_len': 1 if request.param[1] else {}})
         )
         yield lambda: c
         c.clear()
